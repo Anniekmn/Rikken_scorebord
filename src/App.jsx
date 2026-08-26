@@ -1,11 +1,40 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   Plus, Trash2, Trophy, RotateCcw, AlertTriangle, Check, Users,
-  History, Wand2, Armchair, Sparkles, Shuffle,
+  History, Wand2, Armchair, Sparkles, Shuffle, Link2,
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
-const GAME_ID = "default"; // één gedeelde scoreboard-rij in de database
+// Elk spel heeft een eigen code (in de link als ?spel=CODE), zodat meerdere
+// groepen tegelijk en los van elkaar kunnen spelen. Geen code in de link?
+// Dan gebruiken we "default" — zo blijft een eerder gestart spel gewoon
+// bereikbaar zonder dat er iets breekt.
+function getGameIdFromUrl() {
+  try {
+    const code = new URLSearchParams(window.location.search).get("spel");
+    return code ? code.toUpperCase() : "default";
+  } catch (e) {
+    return "default";
+  }
+}
+function setGameIdInUrl(code) {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set("spel", code);
+    window.history.pushState({}, "", url);
+  } catch (e) {
+    // negeren — de app werkt ook zonder dat de link wordt bijgewerkt
+  }
+}
+function genGameCode() {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // zonder 0/O en 1/I/L
+  let code = "";
+  for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+function localKeyFor(gameId) {
+  return `rikken-local-cache-${gameId}`;
+}
 
 // ---- Puntentabel (eigen versie van de gebruiker) --------------------------
 // Index van elke array = aantal gehaalde slagen (0 t/m 13).
@@ -60,6 +89,12 @@ function loadFont() {
 }
 
 export default function RikkenScoreboard() {
+  const [gameId, setGameId] = useState(() => getGameIdFromUrl());
+  const [showGameSwitcher, setShowGameSwitcher] = useState(false);
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [joinError, setJoinError] = useState("");
+  const [switching, setSwitching] = useState(false);
+
   const [loading, setLoading] = useState(true);
   const [players, setPlayers] = useState([
     { id: uid(), name: "Speler 1" },
@@ -96,46 +131,135 @@ export default function RikkenScoreboard() {
 
   useEffect(() => {
     loadFont();
+    setLoading(true);
+    didLoad.current = false;
     (async () => {
+      let loadedFromServer = false;
       try {
         const { data, error } = await supabase
           .from("rikken_state")
           .select("data")
-          .eq("id", GAME_ID)
+          .eq("id", gameId)
           .maybeSingle();
         if (!error && data && data.data) {
-          const saved = data.data;
-          if (saved.players?.length) setPlayers(saved.players);
-          if (saved.rounds) setRounds(saved.rounds);
-          if (saved.dealerId) setDealerId(saved.dealerId);
-          if (saved.players?.length) setTab(saved.rounds?.length ? "geschiedenis" : "ronde");
+          applyLoadedState(data.data);
+          localStorage.setItem(localKeyFor(gameId), JSON.stringify(data.data));
+          loadedFromServer = true;
         }
       } catch (e) {
-        // nog geen opgeslagen spel
-      } finally {
-        setLoading(false);
-        didLoad.current = true;
+        // geen internet of Supabase niet bereikbaar — hieronder valt terug op lokale kopie
       }
+      if (!loadedFromServer) {
+        try {
+          const cached = localStorage.getItem(localKeyFor(gameId));
+          if (cached) applyLoadedState(JSON.parse(cached));
+        } catch (e) {
+          // ook geen lokale kopie — begin gewoon met een leeg spel
+        }
+      }
+      setLoading(false);
+      didLoad.current = true;
     })();
-  }, []);
+  }, [gameId]);
+
+  function applyLoadedState(saved) {
+    setPlayers(
+      saved.players?.length
+        ? saved.players
+        : [
+            { id: uid(), name: "Speler 1" },
+            { id: uid(), name: "Speler 2" },
+            { id: uid(), name: "Speler 3" },
+            { id: uid(), name: "Speler 4" },
+          ]
+    );
+    setRounds(saved.rounds || []);
+    setDealerId(saved.dealerId || "");
+    setTab(saved.rounds?.length ? "geschiedenis" : saved.players?.length ? "ronde" : "spelers");
+  }
+
+  async function syncToSupabase(id, snapshot) {
+    try {
+      const { error } = await supabase.from("rikken_state").upsert({
+        id,
+        data: snapshot,
+        updated_at: new Date().toISOString(),
+      });
+      setSaveState(error ? "offline" : "saved");
+    } catch (e) {
+      setSaveState("offline");
+    }
+  }
 
   useEffect(() => {
     if (!didLoad.current) return;
+    const snapshot = { players, rounds, dealerId };
+    // altijd meteen lokaal bewaren, ook zonder internet
+    try {
+      localStorage.setItem(localKeyFor(gameId), JSON.stringify(snapshot));
+    } catch (e) {
+      // opslag vol of niet beschikbaar — negeren, Supabase-sync is de hoofdweg
+    }
     setSaveState("saving");
-    const t = setTimeout(async () => {
-      try {
-        const { error } = await supabase.from("rikken_state").upsert({
-          id: GAME_ID,
-          data: { players, rounds, dealerId },
-          updated_at: new Date().toISOString(),
-        });
-        setSaveState(error ? "idle" : "saved");
-      } catch (e) {
-        setSaveState("idle");
-      }
-    }, 400);
+    const t = setTimeout(() => syncToSupabase(gameId, snapshot), 400);
     return () => clearTimeout(t);
-  }, [players, rounds, dealerId]);
+  }, [players, rounds, dealerId, gameId]);
+
+  // zodra het apparaat weer online komt, meteen proberen de laatste stand te syncen
+  useEffect(() => {
+    function handleOnline() {
+      if (!didLoad.current) return;
+      syncToSupabase(gameId, { players, rounds, dealerId });
+    }
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, [players, rounds, dealerId, gameId]);
+
+  async function startNewSharedGame() {
+    setSwitching(true);
+    const code = genGameCode();
+    const defaultPlayers = [
+      { id: uid(), name: "Speler 1" },
+      { id: uid(), name: "Speler 2" },
+      { id: uid(), name: "Speler 3" },
+      { id: uid(), name: "Speler 4" },
+    ];
+    try {
+      await supabase.from("rikken_state").upsert({
+        id: code,
+        data: { players: defaultPlayers, rounds: [], dealerId: defaultPlayers[0].id },
+        updated_at: new Date().toISOString(),
+      });
+    } catch (e) {
+      // ook zonder internet gewoon lokaal verder kunnen — sync volgt later vanzelf
+    }
+    setGameIdInUrl(code);
+    setGameId(code);
+    setShowGameSwitcher(false);
+    setSwitching(false);
+  }
+
+  async function joinSharedGame() {
+    const code = joinCodeInput.trim().toUpperCase();
+    if (!code) return;
+    setJoinError("");
+    setSwitching(true);
+    try {
+      const { data, error } = await supabase.from("rikken_state").select("id").eq("id", code).maybeSingle();
+      if (!error && !data) {
+        setJoinError("Deze spelcode bestaat niet. Controleer 'm of start een nieuw spel.");
+        setSwitching(false);
+        return;
+      }
+    } catch (e) {
+      // geen internet — toch proberen te openen, kan lokaal al gecached staan
+    }
+    setGameIdInUrl(code);
+    setGameId(code);
+    setShowGameSwitcher(false);
+    setJoinCodeInput("");
+    setSwitching(false);
+  }
 
   // deler geldig houden: standaard de eerste speler, tenzij handmatig gekozen
   useEffect(() => {
@@ -436,7 +560,51 @@ export default function RikkenScoreboard() {
         <header style={styles.header}>
           <div style={styles.suitRow}>♠ ♥ ♦ ♣</div>
           <h1 style={styles.title}>Rikken Scorebord</h1>
-          <div style={styles.sub}>{saveState === "saving" ? "opslaan…" : "bijgewerkt"}</div>
+          <div style={styles.sub}>
+            {saveState === "saving"
+              ? "opslaan…"
+              : saveState === "offline"
+              ? "offline — lokaal bewaard"
+              : "bijgewerkt"}
+          </div>
+          <button
+            className="rk-btn"
+            style={styles.gameCodeBtn}
+            onClick={() => setShowGameSwitcher((s) => !s)}
+          >
+            <Link2 size={12} style={{ marginRight: 5 }} />
+            Spel: {gameId} · wisselen
+          </button>
+          {showGameSwitcher && (
+            <div style={styles.switcherBox}>
+              <p style={styles.switcherHint}>
+                Deel deze code (of de link) zodat anderen aan dezelfde stand
+                meewerken.
+              </p>
+              <button style={styles.switcherPrimaryBtn} onClick={startNewSharedGame} disabled={switching}>
+                Nieuw spel voor andere groep starten
+              </button>
+              <div style={styles.switcherRow}>
+                <input
+                  className="rk-input"
+                  style={styles.switcherInput}
+                  placeholder="Spelcode invoeren…"
+                  value={joinCodeInput}
+                  onChange={(e) => setJoinCodeInput(e.target.value)}
+                  maxLength={8}
+                />
+                <button style={styles.switcherJoinBtn} onClick={joinSharedGame} disabled={switching}>
+                  Openen
+                </button>
+              </div>
+              {joinError && (
+                <p style={styles.switcherError}>
+                  <AlertTriangle size={13} style={{ marginRight: 5, flexShrink: 0 }} />
+                  {joinError}
+                </p>
+              )}
+            </div>
+          )}
         </header>
 
         <nav style={styles.tabs}>
@@ -466,11 +634,10 @@ export default function RikkenScoreboard() {
             <section>
               <h2 style={styles.h2}>Wie speelt er mee?</h2>
               <p style={styles.hint}>
-                Het spel kan gespeeld worden vanaf 4 spelers, tot maximaal 6.
-                Bij meer dan 4 spelers kies je per ronde wie er speelt — de
-                rest zit die ronde over. Een speler verwijderen kan altijd;
-                eerder gespeelde rondes blijven gewoon in de geschiedenis
-                staan.
+                Rikken speel je met 4 personen; er kunnen tot maximaal 6
+                spelers meedoen. Zijn jullie met meer dan 4? Dan slaat er
+                per ronde steeds iemand een keer over — wie dat is, schuift
+                automatisch door aan de hand van de deler.
               </p>
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 {players.map((p, i) => (
@@ -615,7 +782,7 @@ export default function RikkenScoreboard() {
                 <>
                   <div style={styles.segmented}>
                     {[
-                      { id: "bod", label: "Bod" },
+                      { id: "bod", label: "Bieding" },
                       { id: "pas", label: "Iedereen past" },
                       { id: "handmatig", label: "Handmatig" },
                     ].map((m) => (
@@ -675,7 +842,7 @@ export default function RikkenScoreboard() {
 
                       {spel.type === "maat" && (
                         <div style={{ marginBottom: 14 }}>
-                          <label style={styles.label}>Maat</label>
+                          <label style={styles.label}>Maat (wie is er meegevraagd?)</label>
                           <select
                             className="rk-select"
                             style={{ ...styles.select, marginBottom: maat ? 16 : 6 }}
@@ -1185,6 +1352,61 @@ const styles = {
     letterSpacing: 0.3,
   },
   sub: { color: "#9db8a6", fontSize: 12, marginTop: 4, letterSpacing: 0.5, textTransform: "uppercase" },
+  gameCodeBtn: {
+    marginTop: 10,
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "6px 12px",
+    borderRadius: 999,
+    border: "1px solid rgba(199,165,66,0.5)",
+    background: "rgba(0,0,0,0.18)",
+    color: "#F5EFDD",
+    fontSize: 11.5,
+    fontWeight: 600,
+    letterSpacing: 0.3,
+    cursor: "pointer",
+  },
+  switcherBox: {
+    marginTop: 10,
+    background: "rgba(0,0,0,0.25)",
+    border: "1px solid rgba(199,165,66,0.35)",
+    borderRadius: 12,
+    padding: 14,
+    textAlign: "left",
+  },
+  switcherHint: { color: "#cddbd0", fontSize: 12.5, lineHeight: 1.5, margin: "0 0 10px" },
+  switcherPrimaryBtn: {
+    width: "100%",
+    padding: "10px 12px",
+    borderRadius: 9,
+    border: "none",
+    background: "#C7A542",
+    color: "#123524",
+    fontWeight: 700,
+    fontSize: 13,
+    cursor: "pointer",
+  },
+  switcherRow: { display: "flex", gap: 8, marginTop: 10 },
+  switcherInput: {
+    flex: 1,
+    padding: "9px 10px",
+    borderRadius: 8,
+    border: "1px solid #E0D7BE",
+    background: "#fff",
+    fontSize: 13.5,
+    color: "#23281f",
+  },
+  switcherJoinBtn: {
+    padding: "9px 14px",
+    borderRadius: 8,
+    border: "none",
+    background: "#F5EFDD",
+    color: "#123524",
+    fontWeight: 700,
+    fontSize: 12.5,
+    cursor: "pointer",
+  },
+  switcherError: { display: "flex", alignItems: "center", color: "#ffb4a8", fontSize: 12, marginTop: 8 },
   tabs: { display: "flex", gap: 6, marginBottom: 14, background: "rgba(0,0,0,0.18)", padding: 5, borderRadius: 12 },
   tab: {
     flex: 1,
